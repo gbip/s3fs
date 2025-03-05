@@ -10,6 +10,8 @@ from typing import Tuple, Optional
 import weakref
 import re
 
+import aiohttp
+from fsspec import asyn
 from urllib3.exceptions import IncompleteRead
 
 import fsspec  # noqa: F401
@@ -575,7 +577,10 @@ class S3FileSystem(AsyncFileSystem):
         # the following actually closes the aiohttp connection; use of privates
         # might break in the future, would cause exception at gc time
         if not self.asynchronous:
-            weakref.finalize(self, self.close_session, self.loop, self._s3creator)
+            # weakref.finalize(self, self.close_session, self.loop, self._s3creator)
+            weakref.finalize(
+                self, self.close_session, self.loop, self._s3creator, self.asynchronous
+            )
         self._kwargs_helper = ParamKwargsHelper(self._s3)
         return self._s3
 
@@ -583,26 +588,44 @@ class S3FileSystem(AsyncFileSystem):
 
     connect = sync_wrapper(set_session)
 
+    # Clean up the aiohttp session
+    #
+    # This can run from the main thread if invoked via the weakref callbcak.
+    # This can happen even if the `loop` parameter belongs to another thread
+    # (e.g. the fsspec IO worker). The control flow here is intended to attempt
+    # in-thread asynchronous cleanup first, then fallback to synchronous
+    # cleanup (which can handle cross-thread calls).
     @staticmethod
-    def close_session(loop, s3):
-        if loop is not None and loop.is_running():
-            try:
-                loop = asyncio.get_event_loop()
-                loop.create_task(s3.__aexit__(None, None, None))
-                return
-            except RuntimeError:
-                pass
-            try:
-                sync(loop, s3.__aexit__, None, None, None, timeout=0.1)
-                return
-            except FSTimeoutError:
-                pass
+    def close_session(loop, session: aiohttp.ClientSession, s3, asynchronous=False):
+        if session.closed:
+            return
+        force_close = False
         try:
-            # close the actual socket
-            s3._client._endpoint.http_session._connector._close()
-        except AttributeError:
-            # but during shutdown, it may have gone
-            pass
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+        if loop:
+            # an explicit loop was set
+            if loop.is_running():
+                loop.create_task(session.close())
+            else:
+                force_close = True
+        elif current_loop is not None and current_loop.is_running() and asynchronous:
+            # running in a concurrnet context
+            current_loop.create_task(session.close())
+        elif asyn.loop[0] is not None and asyn.loop[0].is_running():
+            try:
+                asyn.sync(asyn.loop[0], session.close, timeout=0.1)
+            except fsspec.FSTimeoutError:
+                force_close = True
+        else:
+            force_close = True
+        if force_close:
+            # during shutdown, this is the fallback
+            connector = getattr(session, "_connector", None)
+            if connector is not None:
+                # close after loop is dead
+                connector._close()
 
     async def _get_delegated_s3pars(self, exp=3600):
         """Get temporary credentials from STS, appropriate for sending across a
